@@ -21,18 +21,35 @@ fi
 echo "[1/6] Updating package lists..."
 $SUDO apt-get update -qq
 
-echo "[2/6] Installing RTL-SDR drivers..."
+echo "[2/6] Installing RTL-SDR drivers and dependencies..."
 $SUDO apt-get install -y \
   rtl-sdr \
   librtlsdr-dev \
   librtlsdr0 \
   gnuradio \
   gr-gsm \
-  kalibrate-rtl \
   python3-pip \
   python3-requests \
   wireshark-common \
-  tshark
+  tshark \
+  git \
+  build-essential \
+  autoconf \
+  automake \
+  libtool \
+  libfftw3-dev
+
+echo "[2b/6] Building kalibrate-rtl from source..."
+TMPDIR=$(mktemp -d)
+git clone https://github.com/steve-m/kalibrate-rtl "$TMPDIR/kalibrate-rtl"
+cd "$TMPDIR/kalibrate-rtl"
+./bootstrap
+./configure
+make -j$(nproc)
+$SUDO make install
+cd -
+rm -rf "$TMPDIR"
+echo "  kalibrate-rtl installed to /usr/local/bin/kal"
 
 echo "[3/6] Blacklisting DVB-T kernel module (required for RTL-SDR)..."
 BLACKLIST="/etc/modprobe.d/blacklist-rtl.conf"
