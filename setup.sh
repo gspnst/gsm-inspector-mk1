@@ -1,123 +1,172 @@
 #!/bin/bash
 # ============================================================
-# Cell Tower Scanner - Raspberry Pi 5 Setup Script
-# Tested on Raspberry Pi OS Bookworm (Debian 12)
+# TowerScan Setup Script v2
+# Raspberry Pi OS Bookworm (64-bit) + Nooelec NESDR SMArt XTR
 # ============================================================
-
 set -e
-echo "================================================"
-echo " Cell Tower Scanner - Setup"
-echo " Nooelec NESDR SMArt XTR + Raspberry Pi 5"
-echo "================================================"
+
+SUDO=""
+[ "$EUID" -ne 0 ] && SUDO="sudo"
+
+echo "╔══════════════════════════════════════════╗"
+echo "║       TowerScan Setup v2                 ║"
+echo "║  Raspberry Pi 5 + Nooelec NESDR XTR      ║"
+echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# Detect if running as root
-if [ "$EUID" -eq 0 ]; then
-  SUDO=""
-else
-  SUDO="sudo"
-fi
-
-echo "[1/6] Updating package lists..."
+# ── Step 1: System packages ───────────────────────────────────────────────────
+echo "[1/7] Installing system packages..."
 $SUDO apt-get update -qq
-
-echo "[2/6] Installing RTL-SDR drivers and dependencies..."
 $SUDO apt-get install -y \
-  rtl-sdr \
-  librtlsdr-dev \
-  librtlsdr0 \
-  gnuradio \
-  gr-gsm \
-  python3-pip \
-  python3-requests \
-  wireshark-common \
-  tshark \
-  git \
-  build-essential \
-  autoconf \
-  automake \
-  libtool \
+  rtl-sdr librtlsdr-dev librtlsdr0 \
+  python3-pip python3-requests \
+  git build-essential cmake pkg-config \
+  libboost-all-dev libcppunit-dev \
+  swig doxygen \
+  gnuradio gnuradio-dev \
+  gr-osmosdr \
+  libosmocore-dev \
+  libosmosdr-dev \
+  tshark wireshark-common \
+  autoconf automake libtool \
   libfftw3-dev
 
-echo "[2b/6] Building kalibrate-rtl from source..."
-TMPDIR=$(mktemp -d)
-git clone https://github.com/steve-m/kalibrate-rtl "$TMPDIR/kalibrate-rtl"
-cd "$TMPDIR/kalibrate-rtl"
-./bootstrap
-./configure
-make -j$(nproc)
-$SUDO make install
-cd -
-rm -rf "$TMPDIR"
-echo "  kalibrate-rtl installed to /usr/local/bin/kal"
-
-echo "[3/6] Blacklisting DVB-T kernel module (required for RTL-SDR)..."
-BLACKLIST="/etc/modprobe.d/blacklist-rtl.conf"
-if ! grep -q "rtl2832" "$BLACKLIST" 2>/dev/null; then
-  echo "blacklist dvb_usb_rtl28xxu" | $SUDO tee -a "$BLACKLIST"
-  echo "blacklist rtl2832" | $SUDO tee -a "$BLACKLIST"
-  echo "blacklist rtl2830" | $SUDO tee -a "$BLACKLIST"
-  echo "  Blacklist entries added. Reboot required before first scan."
+# ── Step 2: kalibrate-rtl from source ────────────────────────────────────────
+echo ""
+echo "[2/7] Building kalibrate-rtl from source..."
+if command -v kal &>/dev/null; then
+  echo "  Already installed."
 else
-  echo "  Already blacklisted."
+  TMP=$(mktemp -d)
+  git clone --depth=1 https://github.com/steve-m/kalibrate-rtl "$TMP/kal"
+  cd "$TMP/kal"
+  ./bootstrap && ./configure && make -j$(nproc)
+  $SUDO make install
+  cd -
+  rm -rf "$TMP"
+  echo "  Installed to $(which kal)"
 fi
 
-echo "[4/6] Adding udev rules for RTL-SDR..."
-cat << 'EOF' | $SUDO tee /etc/udev/rules.d/20-rtlsdr.rules
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", GROUP="plugdev", MODE="0666", SYMLINK+="rtl_sdr"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0666", SYMLINK+="rtl_sdr"
-EOF
-$SUDO udevadm control --reload-rules
-$SUDO udevadm trigger
-$SUDO usermod -a -G plugdev $USER 2>/dev/null || true
+# ── Step 3: gr-gsm from source ───────────────────────────────────────────────
+echo ""
+echo "[3/7] Building gr-gsm from source (this takes ~10 min on Pi 5)..."
+if command -v grgsm_scanner &>/dev/null; then
+  echo "  Already installed — skipping."
+else
+  GR_DIR="$HOME/gr-gsm-src"
+  [ -d "$GR_DIR" ] && rm -rf "$GR_DIR"
+  git clone --depth=1 https://github.com/ptrkrysik/gr-gsm "$GR_DIR"
 
-echo "[5/6] Installing Python dependencies..."
+  # Apply device.py fix proactively
+  DEVPY="$GR_DIR/python/receiver/device.py"
+  if [ -f "$DEVPY" ]; then
+    python3 - "$DEVPY" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    src = f.read()
+
+new_match = '''def match(dev, filters):
+    dev_str = dev.to_string()
+    if isinstance(filters, dict):
+        for k, v in filters.items():
+            if k + "=" + v not in dev_str:
+                return False
+    return True'''
+
+src = re.sub(r'def match\(dev, filters\):.*?return True',
+             new_match, src, flags=re.DOTALL)
+with open(path, 'w') as f:
+    f.write(src)
+print("  device.py patched.")
+PYEOF
+  fi
+
+  mkdir -p "$GR_DIR/build"
+  cd "$GR_DIR/build"
+  cmake .. \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DCMAKE_BUILD_TYPE=Release \
+    -Wno-dev
+  make -j$(nproc)
+  $SUDO make install
+  $SUDO ldconfig
+  cd -
+  echo "  gr-gsm installed."
+fi
+
+# ── Step 4: Kernel module blacklist ──────────────────────────────────────────
+echo ""
+echo "[4/7] Blacklisting DVB-T kernel modules..."
+BFILE="/etc/modprobe.d/blacklist-rtl.conf"
+for mod in dvb_usb_rtl28xxu rtl2832 rtl2830; do
+  if ! grep -q "$mod" "$BFILE" 2>/dev/null; then
+    echo "blacklist $mod" | $SUDO tee -a "$BFILE" > /dev/null
+    echo "  Blacklisted: $mod"
+  fi
+done
+$SUDO modprobe -r dvb_usb_rtl28xxu rtl2832 rtl2830 2>/dev/null || true
+
+# ── Step 5: udev rules ────────────────────────────────────────────────────────
+echo ""
+echo "[5/7] Setting udev rules for RTL-SDR..."
+cat << 'EOF' | $SUDO tee /etc/udev/rules.d/20-rtlsdr.rules > /dev/null
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", GROUP="plugdev", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0666"
+EOF
+$SUDO udevadm control --reload-rules && $SUDO udevadm trigger
+$SUDO usermod -a -G plugdev "$USER" 2>/dev/null || true
+echo "  udev rules set. You may need to re-plug the dongle."
+
+# ── Step 6: USB power (Pi 5 specific) ────────────────────────────────────────
+echo ""
+echo "[6/7] Configuring USB power for Pi 5..."
+CONF="/boot/firmware/config.txt"
+if ! grep -q "usb_max_current_enable" "$CONF" 2>/dev/null; then
+  echo "usb_max_current_enable=1" | $SUDO tee -a "$CONF" > /dev/null
+  echo "  USB max current enabled."
+else
+  echo "  Already configured."
+fi
+
+# ── Step 7: Python deps ───────────────────────────────────────────────────────
+echo ""
+echo "[7/7] Installing Python dependencies..."
 pip3 install requests --break-system-packages 2>/dev/null || pip3 install requests
 
-echo "[6/6] Verifying RTL-SDR dongle..."
-if rtl_test -t 2>&1 | grep -q "No supported"; then
-  echo "  WARNING: RTL-SDR dongle not detected. Make sure it's plugged in."
-  echo "  Try unplugging and replugging after setup is complete."
-elif rtl_test -t 2>&1 | grep -q "Found"; then
-  echo "  RTL-SDR dongle detected!"
-  # Show device info
-  rtl_test -t 2>&1 | grep -E "Found|Tuner|Crystal" || true
+# ── Verify ────────────────────────────────────────────────────────────────────
+echo ""
+echo "╔══════════════════════════════════════════╗"
+echo "║          Setup complete!                 ║"
+echo "╚══════════════════════════════════════════╝"
+echo ""
+echo "Verifying RTL-SDR dongle..."
+if rtl_test 2>&1 | grep -q "Found"; then
+  rtl_test 2>&1 | grep -E "Found|Tuner|Crystal" | head -5
 else
-  echo "  Could not run rtl_test. Dongle may not be connected yet."
+  echo "  Dongle not detected — plug it in and try: rtl_test"
 fi
 
-echo ""
-echo "================================================"
-echo " Setup complete!"
-echo "================================================"
 echo ""
 echo "NEXT STEPS:"
 echo ""
-echo "1. If prompted, REBOOT now (needed once for blacklist to take effect):"
+echo "1. REBOOT (required for USB power + module blacklist):"
 echo "   sudo reboot"
 echo ""
-echo "2. Find your PPM offset (frequency calibration - do once):"
-echo "   kal -s GSM-900 -d 0"
-echo "   # Note the 'average absolute error' value (e.g. -12 ppm)"
+echo "2. Download OpenCelliD data for Czech Republic (free, ~10MB):"
+echo "   Register at https://opencellid.org/register"
+echo "   wget -O cell_towers.csv.gz \\"
+echo "     'https://opencellid.org/ocid/downloads?token=TOKEN&type=mcc&file=mcc-230.csv.gz'"
 echo ""
-echo "3. Run your first scan (replace coordinates with your location):"
-echo "   python3 scan.py --scan \\"
-echo "     --lat 50.0755 --lon 14.4378 \\"  
-echo "     --bands GSM-900 GSM-1800 \\"
-echo "     --ppm 0 \\"
-echo "     --gain 40"
+echo "3. Import nearby towers (instant map population):"
+echo "   python3 scan.py --import-ocid --lat 50.0759 --lon 14.4378"
 echo ""
-echo "4. Start the web map:"
+echo "4. Run RF scan:"
+echo "   python3 scan.py --scan --lat 50.0759 --lon 14.4378 --bands GSM-900 GSM-1800"
+echo ""
+echo "5. Start map server:"
 echo "   python3 server.py"
-echo "   # Open http://localhost:5000 or http://<pi-ip>:5000"
+echo "   → http://localhost:5000"
 echo ""
-echo "OPTIONAL: OpenCelliD API token for better tower coordinates:"
-echo "   Register free at https://opencellid.org"
-echo "   python3 scan.py --token YOUR_TOKEN_HERE"
-echo ""
-echo "TIPS:"
-echo "  - Antenna: Mount the included antenna as high as possible"
-echo "  - The XTR's TCXO gives excellent frequency stability"
-echo "  - Run kal -s GSM-900 first to calibrate PPM offset"
-echo "  - Use --gain 30-45 for best GSM reception"
-echo "  - Outdoor scanning with a laptop will find more towers"
+echo "6. (Optional) Calibrate PPM offset:"
+echo "   kal -s GSM-900 -g 40"
