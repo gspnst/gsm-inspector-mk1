@@ -70,6 +70,18 @@ def get_bands():
     conn.close()
     return bands
 
+def get_detections(band=None):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if band:
+        c.execute("SELECT * FROM detections WHERE band=? ORDER BY signal_dbm DESC", (band,))
+    else:
+        c.execute("SELECT * FROM detections ORDER BY signal_dbm DESC")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
 def get_stats():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -79,6 +91,10 @@ def get_stats():
     c.execute("SELECT COUNT(*) FROM observations"); stats["observations"] = c.fetchone()[0]
     c.execute("SELECT COUNT(DISTINCT operator) FROM towers"); stats["operators"] = c.fetchone()[0]
     c.execute("SELECT MAX(last_seen) FROM towers"); stats["last_scan"] = c.fetchone()[0] or "never"
+    try:
+        c.execute("SELECT COUNT(*) FROM detections"); stats["detections"] = c.fetchone()[0]
+    except Exception:
+        stats["detections"] = 0
     conn.close()
     return stats
 
@@ -341,7 +357,7 @@ function towerIcon(tower) {
     'GSM-850':  '#00ff88',
     'GSM-1900': '#ffd700',
   };
-  const color = colors[tower.band] || '#a0aec0';
+  const color = tower._is_detection ? '#ffd700' : (colors[tower.band] || '#a0aec0');
   const hasCoords = tower.lat && tower.lon;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="36" viewBox="0 0 28 36">
     <circle cx="14" cy="14" r="12" fill="${hasCoords ? color : '#a0aec0'}" fill-opacity="0.2" stroke="${hasCoords ? color : '#a0aec0'}" stroke-width="1.5"/>
@@ -463,17 +479,39 @@ function applyFilters() {
 }
 
 async function loadData() {
-  const [towersRes, statsRes, opsRes, bandsRes] = await Promise.all([
+  const [towersRes, statsRes, opsRes, bandsRes, detectionsRes] = await Promise.all([
     fetch('/api/towers').then(r => r.json()),
     fetch('/api/stats').then(r => r.json()),
     fetch('/api/operators').then(r => r.json()),
     fetch('/api/bands').then(r => r.json()),
+    fetch('/api/detections').then(r => r.json()),
   ]);
 
   allTowers = towersRes;
 
+  // Merge detections as partial towers (no MCC/MNC yet)
+  const knownArfcns = new Set(allTowers.map(t => t.arfcn));
+  detectionsRes.forEach(d => {
+    if (!knownArfcns.has(d.arfcn)) {
+      allTowers.push({
+        operator: `ARFCN ${d.arfcn} (unidentified)`,
+        band: d.band,
+        freq_mhz: d.freq_mhz,
+        arfcn: d.arfcn,
+        signal_dbm: d.signal_dbm,
+        lat: d.observer_lat,
+        lon: d.observer_lon,
+        mcc: null, mnc: null, lac: null, cell_id: null,
+        seen_count: 1,
+        first_seen: d.timestamp,
+        last_seen: d.timestamp,
+        _is_detection: true,
+      });
+    }
+  });
+
   // Stats
-  document.getElementById('h-total').textContent = statsRes.total;
+  document.getElementById('h-total').textContent = statsRes.total + (statsRes.detections ? ` (+${statsRes.detections} raw)` : '');
   document.getElementById('h-mapped').textContent = statsRes.mapped;
   document.getElementById('h-obs').textContent = statsRes.observations;
   document.getElementById('h-ops').textContent = statsRes.operators;
@@ -586,6 +624,10 @@ class Handler(BaseHTTPRequestHandler):
             obs = get_observations()
             self.send_json(obs)
 
+        elif path == "/api/detections":
+            band = qs.get("band", [None])[0]
+            self.send_json(get_detections(band))
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -598,7 +640,7 @@ if __name__ == "__main__":
         stats = get_stats()
         print(f"Cell Tower Map Server")
         print(f"Database: {DB_PATH}")
-        print(f"  {stats['total']} towers ({stats['mapped']} with GPS) | {stats['observations']} observations")
+        print(f"  {stats['total']} towers ({stats['mapped']} with GPS) | {stats.get('detections',0)} detected carriers | {stats['observations']} observations")
         print(f"\nOpen: http://localhost:{PORT}")
         print("Press Ctrl+C to stop.\n")
 
