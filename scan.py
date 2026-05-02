@@ -110,6 +110,24 @@ def init_db():
         );
     """)
     conn.commit()
+
+    # ── Migrations: safely add columns missing from older databases ──
+    migrations = [
+        "ALTER TABLE towers ADD COLUMN range_m INTEGER DEFAULT 0",
+        "ALTER TABLE towers ADD COLUMN arfcn INTEGER",
+        "ALTER TABLE towers ADD COLUMN freq_mhz REAL",
+        "ALTER TABLE towers ADD COLUMN band TEXT",
+        "ALTER TABLE towers ADD COLUMN signal_dbm REAL",
+        "ALTER TABLE towers ADD COLUMN observer_lat REAL",
+        "ALTER TABLE towers ADD COLUMN observer_lon REAL",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
     conn.close()
 
 # ── ARFCN ↔ Frequency ─────────────────────────────────────────────────────────
