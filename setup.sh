@@ -141,10 +141,11 @@ echo "║          Setup complete!                 ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 echo "Verifying RTL-SDR dongle..."
-if rtl_test 2>&1 | grep -q "Found"; then
-  rtl_test 2>&1 | grep -E "Found|Tuner|Crystal" | head -5
+RTL_OUT=$(timeout 4 rtl_test 2>&1 || true)
+if echo "$RTL_OUT" | grep -q "Found"; then
+  echo "$RTL_OUT" | grep -E "Found|Tuner|Crystal" | head -5
 else
-  echo "  Dongle not detected — plug it in and try: rtl_test"
+  echo "  Dongle not detected or timed out — plug it in and try: rtl_test"
 fi
 
 echo ""
